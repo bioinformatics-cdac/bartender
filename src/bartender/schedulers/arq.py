@@ -1,7 +1,9 @@
-from asyncio import TimeoutError, create_subprocess_shell, gather
+from asyncio import TimeoutError, create_subprocess_shell, gather, sleep, to_thread
+import logging
 from datetime import timedelta
 from typing import Any, Literal, Optional, Union
 
+from functools import partial
 from arq import ArqRedis, Worker, create_pool
 from arq.connections import RedisSettings
 from arq.jobs import Job, JobStatus
@@ -10,6 +12,14 @@ from pydantic.types import PositiveInt
 
 from bartender.db.models.job_model import State
 from bartender.schedulers.abstract import AbstractScheduler, JobDescription
+
+# try:
+from kubernetes import client, config as k8s_config
+# except ImportError:
+#     client = None
+#     k8s_config = None
+
+logger = logging.getLogger(__name__)
 
 
 def _map_arq_status(arq_status: JobStatus, success: bool) -> State:
@@ -56,6 +66,10 @@ class ArqSchedulerConfig(BaseModel):
             The settings based on redis_dsn.
         """
         return RedisSettings.from_dsn(self.redis_dsn)
+
+    k8s_namespace: Optional[str] = None
+    k8s_image: Optional[str] = None
+
 
 
 class ArqScheduler(AbstractScheduler):
@@ -134,6 +148,101 @@ async def _exec(  # noqa: WPS210
     ctx: dict[Any, Any],
     description: JobDescription,
 ) -> None:
+    config: ArqSchedulerConfig = ctx["config"]
+    # if config.k8s_image:
+    await _exec_k8s(ctx, description, config)
+    # else:
+    #     await _exec_local(description)
+
+
+async def _exec_k8s(
+    ctx: dict[Any, Any],
+    description: JobDescription,
+    config: ArqSchedulerConfig,
+) -> None:
+    if client is None:
+        raise ImportError("kubernetes library is not installed")
+
+    # Load config
+    try:
+        await to_thread(k8s_config.load_incluster_config)
+    except k8s_config.ConfigException:
+        await to_thread(k8s_config.load_kube_config)
+
+    batch_api = client.BatchV1Api()
+    core_api = client.CoreV1Api()
+    
+    job_id = ctx["job_id"]
+    namespace = config.k8s_namespace or "ice-haddock"
+    job_name = f"bartender-{job_id}"
+    
+    # Create Job Object
+    job = client.V1Job(
+        api_version="batch/v1",
+        kind="Job",
+        metadata=client.V1ObjectMeta(name=job_name),
+        spec=client.V1JobSpec(
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(labels={"app": "bartender-job"}),
+                spec=client.V1PodSpec(
+                    restart_policy="Never",
+                    containers=[
+                        client.V1Container(
+                            name="job",
+                            image=config.k8s_image,
+                            command=["/bin/sh", "-c", description.command],
+                        )
+                    ]
+                )
+            ),
+            backoff_limit=0,
+        )
+    )
+
+    logger.info(f"Submitting K8s job {job_name} to {namespace}")
+    await to_thread(batch_api.create_namespaced_job, namespace, job)
+
+    # Wait for completion
+    while True:
+        try:
+            k8s_job = await to_thread(batch_api.read_namespaced_job_status, job_name, namespace)
+            if k8s_job.status.succeeded:
+                break
+            if k8s_job.status.failed:
+                raise JobFailureError(f"K8s job {job_name} failed")
+        except client.ApiException as e:
+            logger.error(f"Error checking job status: {e}")
+            raise
+        await sleep(2)
+
+    # Convert logs
+    pod_list = await to_thread(
+        core_api.list_namespaced_pod,
+        namespace,
+        label_selector=f"job-name={job_name}"
+    )
+    if pod_list.items:
+        pod_name = pod_list.items[0].metadata.name
+        logs = await to_thread(core_api.read_namespaced_pod_log, pod_name, namespace)
+        # Assuming simple stdout capture. Splitting stderr is harder without stream.
+        # But read_namespaced_pod_log returns string.
+        # We'll write to stdout.txt
+        (description.job_dir / "stdout.txt").write_text(logs)
+        (description.job_dir / "stderr.txt").write_text("") # No separate stderr
+        (description.job_dir / "returncode").write_text("0")
+    
+    # Cleanup
+    await to_thread(
+        batch_api.delete_namespaced_job,
+        job_name,
+        namespace,
+        propagation_policy="Background",
+    )
+
+
+async def _exec_local(  # noqa: WPS210
+    description: JobDescription,
+) -> None:
     stderr_fn = description.job_dir / "stderr.txt"
     stdout_fn = description.job_dir / "stdout.txt"
 
@@ -163,8 +272,24 @@ def arq_worker(config: ArqSchedulerConfig, burst: bool = False) -> Worker:
     Returns:
         A worker.
     """
+async def _startup(ctx: dict[Any, Any], config: ArqSchedulerConfig) -> None:
+    ctx["config"] = config
+
+
+def arq_worker(config: ArqSchedulerConfig, burst: bool = False) -> Worker:
+    """Worker that runs jobs submitted to arq queue.
+
+    Args:
+        config: The config. Should be equal to the one used to submit job.
+        burst: Whether to stop the worker once all jobs have been run.
+
+    Returns:
+        A worker.
+    """
     functions = [_exec]
     return Worker(
+        on_startup=partial(_startup, config=config),
+
         redis_settings=config.redis_settings,
         queue_name=config.queue,
         max_jobs=config.max_jobs,
