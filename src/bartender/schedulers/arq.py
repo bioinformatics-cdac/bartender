@@ -45,9 +45,9 @@ class ArqSchedulerConfig(BaseModel):
     type: Literal["arq"] = "arq"
     redis_dsn: RedisDsn = parse_obj_as(RedisDsn, "redis://localhost:6379")
     queue: str = "arq:queue"
-    max_jobs: PositiveInt = 10  # noqa: WPS462
+    max_jobs: PositiveInt = 1  # noqa: WPS462
     """Maximum number of jobs to run at a time inside a single worker."""  # noqa: E501, WPS322, WPS428
-    job_timeout: Union[PositiveInt, timedelta] = 3600  # noqa: WPS462
+    job_timeout: Union[PositiveInt, timedelta] = 43200 #3600  # noqa: WPS462
     """Maximum job run time.
 
     Default is one hour.
@@ -160,6 +160,9 @@ async def _exec_k8s(
     description: JobDescription,
     config: ArqSchedulerConfig,
 ) -> None:
+    print(f"ctx: {ctx}", flush=True)
+    print(f"description: {description}", flush=True)
+    print(f"config: {config}", flush=True)
     if client is None:
         raise ImportError("kubernetes library is not installed")
 
@@ -173,7 +176,7 @@ async def _exec_k8s(
     core_api = client.CoreV1Api()
     
     job_id = ctx["job_id"]
-    namespace = config.k8s_namespace or "ice-haddock"
+    namespace = "haddock"
     job_name = f"bartender-{job_id}"
     
     # Create Job Object
@@ -189,8 +192,22 @@ async def _exec_k8s(
                     containers=[
                         client.V1Container(
                             name="job",
-                            image=config.k8s_image,
-                            command=["/bin/sh", "-c", description.command],
+                            image="icr.icecloud.in/k8s/bartender",
+                            command=["/bin/sh", "-c", f"cd {description.job_dir} && {description.command}"],
+                            volume_mounts=[
+                                client.V1VolumeMount(
+                                    name="job-data",
+                                    mount_path="/jobs",
+                                )
+                            ],
+                        )
+                    ],
+                    volumes=[
+                        client.V1Volume(
+                            name="job-data",
+                            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                                claim_name="bartender-job-data"
+                            )
                         )
                     ]
                 )
@@ -213,7 +230,7 @@ async def _exec_k8s(
         except client.ApiException as e:
             logger.error(f"Error checking job status: {e}")
             raise
-        await sleep(2)
+        await sleep(30)
 
     # Convert logs
     pod_list = await to_thread(
@@ -286,6 +303,9 @@ def arq_worker(config: ArqSchedulerConfig, burst: bool = False) -> Worker:
     Returns:
         A worker.
     """
+    
+    print(f"arq_worker config: {config}", flush=True)
+
     functions = [_exec]
     return Worker(
         on_startup=partial(_startup, config=config),
@@ -306,5 +326,7 @@ async def run_workers(configs: list[ArqSchedulerConfig]) -> None:
     Args:
         configs: The configs.
     """
+    print(f"run_workers config: {configs}", flush=True)
     workers = [arq_worker(config) for config in configs]
     await gather(*[worker.async_run() for worker in workers])
+
