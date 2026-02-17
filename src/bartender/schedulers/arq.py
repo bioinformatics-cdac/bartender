@@ -1,3 +1,4 @@
+import os
 from asyncio import TimeoutError, create_subprocess_shell, gather, sleep, to_thread
 import logging
 from datetime import timedelta
@@ -150,9 +151,10 @@ async def _exec(  # noqa: WPS210
 ) -> None:
     config: ArqSchedulerConfig = ctx["config"]
     # if config.k8s_image:
-    await _exec_k8s(ctx, description, config)
-    # else:
-    #     await _exec_local(description)
+    if os.environ.get("USE_K8S") == "True":
+        await _exec_k8s(ctx, description, config)
+    else:
+        await _exec_local(description)
 
 
 async def _exec_k8s(
